@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = { find = { where = ["src"] } }
+
+[project]
+name = "gdloc"
+version = "0.1.0"
+description = "gdloc"
+authors = [
+    { name = "Rupert Bauernfeind", email = "rupertbauernfeind@example.com" },
+]
+readme = "README.md"
+requires-python = ">=3.8"
+
+
+dependencies = [
+    # # Torch Ecosystem (GPU, CUDA 11.8)
+    # "torch==2.7.1+cu118",
+    # "torchaudio==2.7.1+cu118",
+    # "torchvision==0.22.1+cu118",
+
+    # # TensorBoard for logging
+    # "tensorboard",
+
+    # # HuggingFace
+    # "transformers==4.52.4",
+    # "huggingface-hub==0.33.0",
+    # "accelerate",
+    # "bitsandbytes",
+
+    # # PyTorch Geometric (wird meist via pip install torch-geometric + extra wheels installiert)
+    # "torch-geometric",
+    # # "torch-scatter",
+
+    # Jupyter / Notebook
+    "notebook",
+    "ipywidgets",
+
+    # ML/Stats
+    "scikit-learn",
+    "pandas",
+
+    # Visualization
+    "matplotlib",
+    "plotly",
+    "graphviz",
+    "pyvis",
+
+    # Data / Storage
+    # "duckdb",
+    # "pyarrow",
+
+    # "seaborn",
+
+]
+
+[project.optional-dependencies]
+cuda = [
+  "torch==2.7.1+cu118",
+  "torchaudio==2.7.1+cu118",
+  "torchvision==0.22.1+cu118",
+
+  "tensorboard",
+
+  "transformers==4.52.4",
+  "huggingface-hub==0.33.0",
+  "accelerate",
+  "bitsandbytes",
+  # Optuna for hyperparameter optimization
+  "optuna",
+]
+dev = ["pytest", "black", "mypy"]
+scat = ["torch-scatter"]
+
+
+# [project.scripts]
+# <function-call> = "...-...-..g:main"
