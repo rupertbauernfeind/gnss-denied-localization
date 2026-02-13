@@ -19,17 +19,17 @@ requires-python = ">=3.8"
 
 dependencies = [
     # # Torch Ecosystem (GPU, CUDA 11.8)
-    # "torch==2.7.1+cu118",
-    # "torchaudio==2.7.1+cu118",
-    # "torchvision==0.22.1+cu118",
+    "torch==2.7.1+cu118",
+    "torchaudio==2.7.1+cu118",
+    "torchvision==0.22.1+cu118",
 
-    # # TensorBoard for logging
-    # "tensorboard",
+    # TensorBoard for logging
+    "tensorboard",
 
-    # # HuggingFace
-    # "transformers==4.52.4",
-    # "huggingface-hub==0.33.0",
-    # "accelerate",
+    # HuggingFace
+    "transformers==4.52.4",
+    "huggingface-hub==0.33.0",
+    "accelerate",
     # "bitsandbytes",
 
     # # PyTorch Geometric (wird meist via pip install torch-geometric + extra wheels installiert)
@@ -49,7 +49,7 @@ dependencies = [
     "plotly",
     "graphviz",
     "pyvis",
-    "opencv-python",
+    "opencv-python-headless",
 
     # Data / Storage
     # "duckdb",
