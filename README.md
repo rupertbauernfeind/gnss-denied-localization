@@ -12,19 +12,9 @@ If the files cannot be downloaded automatically, please save them manually in th
 
 ```
 data/
-├── wordnet
-│   └── corpora
-│       └── wordnet.zip
-├── datasets
-│   |── imagenette
-│   |   └── imagenette2-320
-│   |       └── imagenette2-320.tgz
-│   └── cifar10
-│       └── cifar-10-batches-py
-│       └── cifar-10-python.tar.gz
-└── models
-    └── clip
-        └── ViT-B-32.pt
+├── test_data
+├── train_data
+├── map.png
 ```
 
 
