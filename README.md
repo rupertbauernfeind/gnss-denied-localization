@@ -1,12 +1,9 @@
+## -> [Link to Kaggle Page](https://www.kaggle.com/competitions/gnss-denied-localization-msc-hackathon-12-th-15th-feb/overview)
+
 ### Install pip package:
 ```sh
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu118 
-```
-### Install torch-scatter (PyTorch Geometric dependency):
-```sh
-pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.1+cu118.html
-or 
-pip install -e '.[scat]' --extra-index-url https://download.pytorch.org/whl/cu118 -f https://data.pyg.org/whl/torch-2.7.1+cu118.html 
+# pip install -e . --extra-index-url https://download.pytorch.org/whl/cu118 
+python3 -m venv .venv && source .venv/bin/activate && pip install .
 ```
 
 ### Resource Directory Structure
@@ -14,7 +11,7 @@ pip install -e '.[scat]' --extra-index-url https://download.pytorch.org/whl/cu11
 If the files cannot be downloaded automatically, please save them manually in the following locations:
 
 ```
-lfs_data/
+data/
 ├── wordnet
 │   └── corpora
 │       └── wordnet.zip
@@ -30,10 +27,6 @@ lfs_data/
         └── ViT-B-32.pt
 ```
 
-- `wordnet.zip` should be placed in `lfs_data/wordnet/corpora/`
-- `ViT-B-32.pt` should be placed in `lfs_data/models/clip/`
-- `cifar-10-python.tar.gz` should be placed in `lfs_data/datasets/cifar10/`
-- `imagenette2-320.tgz` should be placed in `lfs_data/datasets/imagenette/`
 
 
 ### Command to track the GPU usage
