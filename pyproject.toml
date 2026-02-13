@@ -49,8 +49,8 @@ dependencies = [
     "plotly",
     "graphviz",
     "pyvis",
-    "opencv-python",
-
+    # "opencv-python",
+    "opencv-contrib-python",
     # Data / Storage
     # "duckdb",
     # "pyarrow",
