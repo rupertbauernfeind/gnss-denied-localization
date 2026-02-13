@@ -1,9 +1,9 @@
 """
-Refine rough position predictions using RoMa v2 learned feature matching.
+Refine rough position predictions using MASt3R learned feature matching.
 
 For each image:
   1. Crop the map around the rough predicted position
-  2. Match features using RoMa v2 (dense matcher, handles cross-domain gap)
+  2. Match features using MASt3R (asymmetric dense matcher, handles cross-domain gap)
   3. Compute a homography (RANSAC) and project the image center
      onto the map to get a refined position
 
@@ -22,14 +22,44 @@ os.environ["TORCHDYNAMO_DISABLE"] = "1"  # skip torch.compile (no MSVC/GPU)
 
 import cv2
 import numpy as np
-from romav2 import RoMaV2
 from tqdm import tqdm
+
+try:
+    from romav2 import RoMaV2
+    ROMA_AVAILABLE = True
+except ImportError:
+    ROMA_AVAILABLE = False
+    RoMaV2 = None
+
+# MASt3R environment setup
+MAST3R_DIR = Path.home() / "mast3r"
+if MAST3R_DIR.exists():
+    import sys
+    sys.path.insert(0, str(MAST3R_DIR))
+    _original_cwd = os.getcwd()
+    os.chdir(str(MAST3R_DIR))
+
+try:
+    from mast3r.model import AsymmetricMASt3R
+    from mast3r.fast_nn import fast_reciprocal_NNs
+    import mast3r.utils.path_to_dust3r
+    from dust3r.inference import inference
+    from dust3r.utils.image import load_images
+    import torch
+    MAST3R_AVAILABLE = True
+
+    # Restore original working directory after imports
+    if MAST3R_DIR.exists():
+        os.chdir(_original_cwd)
+except ImportError:
+    MAST3R_AVAILABLE = False
+    torch = None
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 CROP_SIZE = 500          # px — map crop around rough prediction
-MATCH_SIZE = 256         # px — resize both images to this before RoMa (CPU speed)
+MATCH_SIZE = 512         # px — resize both images to this before MASt3R (512=training res)
 NUM_MATCHES = 5000       # number of correspondences to sample from dense match
 MIN_INLIERS = 20         # minimum RANSAC inliers to accept refinement
 MAX_DRIFT = 250          # px — discard refinement if it moves too far from rough
@@ -65,6 +95,146 @@ def id_to_filename(img_id):
 # ---------------------------------------------------------------------------
 # Core
 # ---------------------------------------------------------------------------
+def refine_one_mast3r(img_id, rough_x, rough_y, full_map, image_dir, model, device):
+    """Try to refine a single image using MASt3R. Returns (x, y, n_inliers) or None."""
+    from PIL import Image
+    import tempfile
+
+    # 1. Crop map around rough prediction (full res for accuracy)
+    cx = int(round(rough_x))
+    cy = int(round(rough_y))
+    x0 = max(0, min(MAP_W - CROP_SIZE, cx - CROP_SIZE // 2))
+    y0 = max(0, min(MAP_H - CROP_SIZE, cy - CROP_SIZE // 2))
+    map_crop = full_map[y0 : y0 + CROP_SIZE, x0 : x0 + CROP_SIZE]
+
+    # 2. Load drone image
+    img_path = str(image_dir / id_to_filename(img_id))
+    drone = cv2.imread(img_path)
+    if drone is None:
+        return None
+
+    # 3. Pre-resize drone to 512px width (like test_one.py)
+    h_orig, w_orig = drone.shape[:2]
+    mast3r_w = MATCH_SIZE
+    mast3r_scale = mast3r_w / w_orig
+    drone_resized = cv2.resize(drone, (mast3r_w, int(h_orig * mast3r_scale)))
+
+    # 4. BGR -> RGB for MASt3R
+    drone_rgb = cv2.cvtColor(drone_resized, cv2.COLOR_BGR2RGB)
+    crop_rgb = cv2.cvtColor(map_crop, cv2.COLOR_BGR2RGB)
+
+    # Save pre-resized dimensions (test_one.py uses these for center calculation)
+    h_pre, w_pre = drone_resized.shape[:2]
+
+    # 5. Convert to PIL and save to temp files (load_images expects paths)
+    drone_pil = Image.fromarray(drone_rgb)
+    crop_pil = Image.fromarray(crop_rgb)
+
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_drone:
+        drone_pil.save(tmp_drone.name, 'JPEG')
+        drone_path = tmp_drone.name
+
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_crop:
+        crop_pil.save(tmp_crop.name, 'JPEG')
+        crop_path = tmp_crop.name
+
+    try:
+        # 6. Load images and run MASt3R inference
+        images = load_images([drone_path, crop_path], size=MATCH_SIZE)
+
+        with torch.inference_mode():
+            output = inference([tuple(images)], model, device, batch_size=1, verbose=False)
+
+        view1, pred1 = output['view1'], output['pred1']
+        view2, pred2 = output['view2'], output['pred2']
+
+        desc1 = pred1['desc'].squeeze(0).detach()
+        desc2 = pred2['desc'].squeeze(0).detach()
+
+        # 7. Find 2D-2D matches using fast reciprocal nearest neighbors
+        matches_im0, matches_im1 = fast_reciprocal_NNs(
+            desc1, desc2, subsample_or_initxy1=8,
+            device=device, dist='dot', block_size=2**13
+        )
+
+        # 8. Get actual image shapes from MASt3R output
+        H0, W0 = view1['true_shape'][0]
+        H1, W1 = view2['true_shape'][0]
+
+        # DEBUG
+        if img_id in [13, 14, 15]:
+            print(f"\n[DEBUG img {img_id}] Drone true_shape: {W0}x{H0}, Crop true_shape: {W1}x{H1}")
+
+        # Filter by border (3px)
+        valid_matches_im0 = (matches_im0[:, 0] >= 3) & (matches_im0[:, 0] < int(W0) - 3) & \
+                            (matches_im0[:, 1] >= 3) & (matches_im0[:, 1] < int(H0) - 3)
+
+        valid_matches_im1 = (matches_im1[:, 0] >= 3) & (matches_im1[:, 0] < int(W1) - 3) & \
+                            (matches_im1[:, 1] >= 3) & (matches_im1[:, 1] < int(H1) - 3)
+
+        valid_matches = valid_matches_im0 & valid_matches_im1
+        matches_im0 = matches_im0[valid_matches]
+        matches_im1 = matches_im1[valid_matches]
+
+        # DEBUG
+        if img_id in [13, 14, 15]:
+            print(f"[DEBUG img {img_id}] Matches after border filter: {len(matches_im0)}")
+
+        if len(matches_im0) < 4:
+            return None
+
+        # 9. Compute homography directly in true_shape coordinates (no scaling!)
+        # This preserves aspect ratios and geometric relationships
+        src_pts = matches_im0.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts = matches_im1.reshape(-1, 1, 2).astype(np.float32)
+
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if H is None or mask is None:
+            return None
+
+        n_inliers = int(mask.sum())
+
+        # DEBUG
+        if img_id in [13, 14, 15]:
+            print(f"[DEBUG img {img_id}] RANSAC inliers: {n_inliers}")
+
+        if n_inliers < MIN_INLIERS:
+            return None
+
+        # 10. Project drone center through homography
+        # Use pre-resized dimensions (matching test_one.py approach)
+        center_x = float(w_pre) / 2
+        center_y = float(h_pre) / 2
+        center = np.float32([[center_x, center_y]]).reshape(-1, 1, 2)
+        projected = cv2.perspectiveTransform(center, H)
+        crop_x, crop_y = projected[0, 0]
+
+        # 11. Convert to world coordinates (no scaling, matching test_one.py)
+        world_x = crop_x + x0
+        world_y = crop_y + y0
+
+        # DEBUG
+        if img_id in [13, 14, 15]:
+            print(f"[DEBUG img {img_id}] Pre-resized drone: {w_pre}x{h_pre}")
+            print(f"[DEBUG img {img_id}] Center in pre-resized: ({center_x:.1f}, {center_y:.1f})")
+            print(f"[DEBUG img {img_id}] Projected: ({crop_x:.1f}, {crop_y:.1f})")
+            print(f"[DEBUG img {img_id}] Offset: x0={x0}, y0={y0}")
+            print(f"[DEBUG img {img_id}] World coords: ({world_x:.1f}, {world_y:.1f})\n")
+
+        # 12. Sanity check
+        drift = math.sqrt((world_x - rough_x) ** 2 + (world_y - rough_y) ** 2)
+        if drift > MAX_DRIFT:
+            return None
+
+        return (world_x, world_y, n_inliers)
+    finally:
+        # Clean up temporary files
+        if os.path.exists(drone_path):
+            os.unlink(drone_path)
+        if os.path.exists(crop_path):
+            os.unlink(crop_path)
+
+
 def refine_one(img_id, rough_x, rough_y, full_map, image_dir, matcher):
     """Try to refine a single image. Returns (x, y, n_inliers) or None."""
 
@@ -162,10 +332,14 @@ def main():
     print(f"  Map: {full_map.shape[1]}x{full_map.shape[0]}")
     print(f"  Rough predictions: {len(rough)}")
 
-    # Set up RoMa v2
-    print("Loading RoMa v2 model...")
-    matcher = RoMaV2()
-    print("  RoMa v2 ready")
+    # Set up MASt3R
+    if not MAST3R_AVAILABLE:
+        raise RuntimeError("MASt3R is not available. Please ensure it's installed in ~/mast3r")
+
+    print("Loading MASt3R model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AsymmetricMASt3R.from_pretrained("naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric").to(device)
+    print(f"  MASt3R ready (device={device})")
 
     refined = {}
     n_success = 0
@@ -175,7 +349,7 @@ def main():
     print(f"\nProcessing {len(ids)} images...\n")
     for img_id in tqdm(ids, desc="Refining"):
         rough_x, rough_y = rough[img_id]
-        result = refine_one(img_id, rough_x, rough_y, full_map, image_dir, matcher)
+        result = refine_one_mast3r(img_id, rough_x, rough_y, full_map, image_dir, model, device)
 
         if result is not None:
             world_x, world_y, n_inliers = result
