@@ -27,6 +27,7 @@ from .feature_map_pipeline import (
     run_train_val_feature_map,
     try_load_pycolmap_reconstruction,
 )
+from .sfm_sift import SFM_Sift, SIFTSFMConfig
 
 __all__ = [
     "CameraIntrinsics",
@@ -54,4 +55,6 @@ __all__ = [
     "predict_validation_from_train_retrieval",
     "run_train_val_feature_map",
     "try_load_pycolmap_reconstruction",
+    "SFM_Sift",
+    "SIFTSFMConfig",
 ]
