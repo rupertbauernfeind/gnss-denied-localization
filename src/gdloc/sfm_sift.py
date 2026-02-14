@@ -118,6 +118,7 @@ class SFM_Sift:
 
         # Pseudo-code requested structures.
         self._predictions: np.ndarray = np.zeros((0, 2), dtype=np.float64)
+        self._predictions_global: np.ndarray = np.zeros((0, 2), dtype=np.float64)
         self._ground_truth: np.ndarray = np.zeros((0, 2), dtype=np.float64)
         self._train_mask: np.ndarray = np.zeros((0,), dtype=bool)
         self._test_ranges: List[Tuple[int, int]] = []
@@ -231,6 +232,7 @@ class SFM_Sift:
         for iid, xy in self._train_pos_map.items():
             self._ground_truth[self._id_to_idx[iid]] = xy
         self._predictions = np.full((n, 2), np.nan, dtype=np.float64)
+        self._predictions_global = np.full((n, 2), np.nan, dtype=np.float64)
 
         self._test_ranges = self._build_ranges(self._test_ids)
         self._reset_caches()
@@ -665,6 +667,17 @@ class SFM_Sift:
         idx = self._id_to_idx[int(image_id)]
         self._predictions[idx] = np.asarray(xy, dtype=np.float64).reshape(2)
 
+    def _get_global_prediction(self, image_id: int) -> Optional[np.ndarray]:
+        idx = self._id_to_idx[int(image_id)]
+        p = self._predictions_global[idx]
+        if np.isfinite(p).all():
+            return p.copy()
+        return None
+
+    def _set_global_prediction(self, image_id: int, xy: np.ndarray) -> None:
+        idx = self._id_to_idx[int(image_id)]
+        self._predictions_global[idx] = np.asarray(xy, dtype=np.float64).reshape(2)
+
     def _get_ground_truth(self, image_id: int) -> Optional[np.ndarray]:
         if int(image_id) not in self._train_pos_map:
             return None
@@ -1004,9 +1017,93 @@ class SFM_Sift:
             entry_inliers_backward=inl_bwd,
         )
 
+    def _segment_geom_predictions(self, plan: SegmentPlan) -> Tuple[Dict[int, np.ndarray], Dict[str, object]]:
+        anchor_id = int(plan.anchor_train_id)
+        anchor_pose = self._train_pos_map[anchor_id].copy()
+
+        path_ids: List[int] = [anchor_id] + [int(x) for x in plan.ordered_test_ids]
+        if len(path_ids) <= 1:
+            return {}, {"source": "none", "anchor_id": anchor_id, "ref_id": None, "scale": 1.0, "yaw_deg": 0.0}
+
+        t_to_anchor: Dict[int, np.ndarray] = {anchor_id: np.eye(3, dtype=np.float64)}
+        for prev_id, curr_id in zip(path_ids[:-1], path_ids[1:]):
+            m = self._estimate_pair_motion(int(prev_id), int(curr_id))
+            if (m.affine_M_1to0 is not None) and (m.affine_inliers >= int(self.cfg.seq_min_affine_inliers)):
+                m_used = m.affine_M_1to0.astype(np.float64)
+            else:
+                m_used = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+            h_curr_to_prev = self._affine2x3_to_hom(m_used)
+            t_to_anchor[curr_id] = t_to_anchor[prev_id] @ h_curr_to_prev
+
+        close_id = int(plan.closing_train_id) if plan.closing_train_id is not None else None
+        if close_id is not None and len(path_ids) > 0:
+            last_id = int(path_ids[-1])
+            m_close = self._estimate_pair_motion(last_id, close_id)
+            if (m_close.affine_M_1to0 is not None) and (m_close.affine_inliers >= int(self.cfg.seq_min_affine_inliers)):
+                h_close_to_last = self._affine2x3_to_hom(m_close.affine_M_1to0.astype(np.float64))
+                t_to_anchor[close_id] = t_to_anchor[last_id] @ h_close_to_last
+
+        anchor_gray, _ = self._load_preprocessed_gray(
+            anchor_id,
+            max_side=self.cfg.image_max_side,
+            mode=self.cfg.preprocess_mode,
+        )
+        ah, aw = anchor_gray.shape[:2]
+        anchor_center = np.array([aw * 0.5, ah * 0.5], dtype=np.float32)
+
+        rel_by_id: Dict[int, np.ndarray] = {}
+        rel_ids = list(path_ids)
+        if close_id is not None and close_id in t_to_anchor:
+            rel_ids.append(close_id)
+        for iid in rel_ids:
+            gray, _ = self._load_preprocessed_gray(
+                int(iid),
+                max_side=self.cfg.image_max_side,
+                mode=self.cfg.preprocess_mode,
+            )
+            h, w = gray.shape[:2]
+            center = np.array([[w * 0.5, h * 0.5]], dtype=np.float32)
+            center_anchor = self._transform_points_hom(t_to_anchor[int(iid)], center)[0]
+            rel_by_id[int(iid)] = (center_anchor - anchor_center).astype(np.float64)
+
+        cal_scale = 1.0
+        cal_angle = 0.0
+        cal_source = "none"
+        ref_id = None
+
+        if close_id is not None and close_id in rel_by_id and close_id in self._train_pos_map:
+            rel = rel_by_id[close_id]
+            ref_pose = self._train_pos_map[close_id]
+            nr = float(np.linalg.norm(rel))
+            ng = float(np.linalg.norm(ref_pose - anchor_pose))
+            if nr > 1e-6 and ng > 1e-6:
+                cal_scale = ng / nr
+                cal_angle = float(
+                    np.arctan2((ref_pose - anchor_pose)[1], (ref_pose - anchor_pose)[0]) - np.arctan2(rel[1], rel[0])
+                )
+                cal_source = "closing_gt"
+                ref_id = int(close_id)
+
+        r_cal = self._build_rot(cal_angle)
+        out: Dict[int, np.ndarray] = {}
+        for tid in plan.ordered_test_ids:
+            tid_i = int(tid)
+            if tid_i not in rel_by_id:
+                continue
+            out[tid_i] = (anchor_pose + (r_cal @ rel_by_id[tid_i]) * cal_scale).astype(np.float64)
+
+        return out, {
+            "source": cal_source,
+            "anchor_id": anchor_id,
+            "ref_id": ref_id,
+            "scale": float(cal_scale),
+            "yaw_deg": float(np.degrees(cal_angle)),
+        }
+
     def forward_test_set(self) -> pd.DataFrame:
         self._require_dataset()
         self._require_model()
+        self._predictions_global[:] = np.nan
 
         segment_plans: List[SegmentPlan] = []
         for i, (start_id, end_id) in enumerate(self._test_ranges):
@@ -1107,6 +1204,15 @@ class SFM_Sift:
                 }
             )
 
+            geom_pred_by_id, geom_meta = self._segment_geom_predictions(p)
+            for tid, gxy in geom_pred_by_id.items():
+                self._set_global_prediction(int(tid), gxy)
+            if len(segment_diag_rows) > 0:
+                segment_diag_rows[-1]["geom_source"] = geom_meta.get("source")
+                segment_diag_rows[-1]["geom_ref_id"] = geom_meta.get("ref_id")
+                segment_diag_rows[-1]["geom_scale"] = geom_meta.get("scale")
+                segment_diag_rows[-1]["geom_yaw_deg"] = geom_meta.get("yaw_deg")
+
         missing = [tid for tid in self._test_ids if not self._has_prediction(int(tid))]
         if len(missing) > 0:
             for tid in missing:
@@ -1117,7 +1223,7 @@ class SFM_Sift:
         self._last_segment_diag_df = pd.DataFrame(segment_diag_rows)
         return self._last_segment_diag_df
 
-    def export_submission_csv(self, output_path: Optional[Path] = None) -> pd.DataFrame:
+    def export_submission_csv(self, output_path: Optional[Path] = None, use_global: bool = True) -> pd.DataFrame:
         self._require_dataset()
         if output_path is None:
             output_path = Path("notebooks/submission.csv")
@@ -1125,7 +1231,9 @@ class SFM_Sift:
 
         rows: List[Dict[str, object]] = []
         for tid in sorted(self._test_ids):
-            pred = self._get_prediction(int(tid))
+            pred = self._get_global_prediction(int(tid)) if bool(use_global) else None
+            if pred is None:
+                pred = self._get_prediction(int(tid))
             if pred is None:
                 prev_train = max([t for t in self._train_ids if t < int(tid)], default=min(self._train_ids))
                 pred = self._train_pos_map[int(prev_train)].copy()
@@ -1136,6 +1244,54 @@ class SFM_Sift:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         submission.to_csv(output_path, index=False)
         return submission
+
+    def plot_all_positions_on_map(
+        self,
+        use_global: bool = True,
+        show_labels: bool = False,
+        test_color: str = "red",
+        figsize: Tuple[float, float] = (14, 10),
+    ) -> None:
+        self._require_dataset()
+        if self.map_path is None or not self.map_path.exists():
+            raise FileNotFoundError("map_path missing or not found.")
+
+        map_bgr = cv2.imread(str(self.map_path), cv2.IMREAD_COLOR)
+        if map_bgr is None:
+            raise RuntimeError(f"Cannot read map image: {self.map_path}")
+        map_rgb = cv2.cvtColor(map_bgr, cv2.COLOR_BGR2RGB)
+
+        train_xy = np.array([self._train_pos_map[iid] for iid in self._train_ids], dtype=np.float64)
+
+        test_pts: List[np.ndarray] = []
+        test_ids_valid: List[int] = []
+        for tid in self._test_ids:
+            p = self._get_global_prediction(int(tid)) if bool(use_global) else None
+            if p is None:
+                p = self._get_prediction(int(tid))
+            if p is None:
+                continue
+            test_pts.append(p.astype(np.float64))
+            test_ids_valid.append(int(tid))
+
+        test_xy = np.vstack(test_pts) if len(test_pts) > 0 else np.zeros((0, 2), dtype=np.float64)
+
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        ax.imshow(map_rgb)
+        ax.scatter(train_xy[:, 0], train_xy[:, 1], s=9, c="deepskyblue", alpha=0.45, label="train GT")
+
+        if test_xy.shape[0] > 0:
+            ax.plot(test_xy[:, 0], test_xy[:, 1], "-", color=test_color, linewidth=1.0, alpha=0.75)
+            ax.scatter(test_xy[:, 0], test_xy[:, 1], s=18, c=test_color, alpha=0.9, label="test predicted")
+            if bool(show_labels):
+                for i, tid in enumerate(test_ids_valid):
+                    ax.text(test_xy[i, 0] + 4.0, test_xy[i, 1] + 4.0, str(tid), color=test_color, fontsize=7)
+
+        ax.set_title(f"All positions on map | test_mode={'global' if use_global else 'raw'}")
+        ax.legend(loc="upper right")
+        ax.axis("off")
+        plt.tight_layout()
+        plt.show()
 
     @staticmethod
     def _affine2x3_to_hom(m_aff: np.ndarray) -> np.ndarray:
@@ -1154,8 +1310,11 @@ class SFM_Sift:
 
     def _pose_for_plot_optional(self, image_id: int, validation: bool) -> Optional[np.ndarray]:
         pred = self._get_prediction(int(image_id))
+        pred_global = self._get_global_prediction(int(image_id))
         gt = self._get_ground_truth(int(image_id))
         if validation:
+            if pred_global is not None:
+                return pred_global
             if pred is not None:
                 return pred
             if gt is not None:
@@ -1163,6 +1322,8 @@ class SFM_Sift:
             return None
         if gt is not None:
             return gt
+        if pred_global is not None:
+            return pred_global
         if pred is not None:
             return pred
         return None
@@ -1318,7 +1479,13 @@ class SFM_Sift:
             [p if p is not None else np.array([np.nan, np.nan], dtype=np.float64) for p in pose_used_list],
             dtype=np.float64,
         )
-        gt_xy = np.array([self._train_pos_map[iid] for iid in ids if iid in self._train_pos_map], dtype=np.float64)
+        gt_xy = np.array(
+            [
+                self._train_pos_map[iid] if iid in self._train_pos_map else np.array([np.nan, np.nan], dtype=np.float64)
+                for iid in ids
+            ],
+            dtype=np.float64,
+        )
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         axes[0].imshow(overlay)
@@ -1361,10 +1528,29 @@ class SFM_Sift:
                 alpha=0.85,
                 label="pose used (raw)",
             )
-        if gt_xy.shape[0] > 0:
-            axes[1].scatter(gt_xy[:, 0], gt_xy[:, 1], s=22, c="deepskyblue", alpha=0.7, label="train GT")
+        valid_gt = np.isfinite(gt_xy[:, 0]) & np.isfinite(gt_xy[:, 1])
+        if np.any(valid_gt):
+            axes[1].scatter(gt_xy[valid_gt, 0], gt_xy[valid_gt, 1], s=22, c="deepskyblue", alpha=0.7, label="train GT")
         for i, iid in enumerate(ids):
             axes[1].text(overlay_global[i, 0] + 6.0, overlay_global[i, 1] + 6.0, str(iid), color="crimson", fontsize=7)
+            if valid_used[i]:
+                axes[1].text(
+                    pose_used_xy[i, 0] + 6.0,
+                    pose_used_xy[i, 1] - 7.0,
+                    str(iid),
+                    color="darkorange",
+                    fontsize=7,
+                    alpha=0.95,
+                )
+            if valid_gt[i]:
+                axes[1].text(
+                    gt_xy[i, 0] - 7.0,
+                    gt_xy[i, 1] + 10.0,
+                    str(iid),
+                    color="deepskyblue",
+                    fontsize=7,
+                    alpha=0.95,
+                )
         cal_note = "ref=none"
         if ref_idx is not None:
             cal_note = f"{cal_source} ref={ids[ref_idx]} scale={cal_scale:.3f} yaw={np.degrees(cal_angle):.2f}deg"
