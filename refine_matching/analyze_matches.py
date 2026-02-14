@@ -1631,5 +1631,260 @@ def method_local_similarity(kp_drone, kp_crop, H, mask, crop_offset, drone_shape
     return x_crop + crop_offset[0], y_crop + crop_offset[1], f"Local Sim r={radius}"
 
 
+def method_top_median(kp_drone, kp_crop, H, mask, crop_offset, drone_shape):
+    """
+    Ensemble method: median of top 3 diverse methods.
+
+    Combines predictions from:
+    - Similarity thresh=1.0 (4 DOF - rotation + uniform scale)
+    - Homography center (8 DOF - full perspective)
+    - Affine RANSAC (6 DOF - non-uniform scale + shear)
+
+    Takes the median x and median y across the three predictions.
+    If any method fails, uses only the successful ones.
+    """
+    import numpy as np
+
+    predictions = []
+    method_names = []
+
+    # Method 1: Similarity thresh=1.0
+    x1, y1, desc1 = method_similarity_ransac_thresh(kp_drone, kp_crop, H, mask, crop_offset, drone_shape, threshold=1.0)
+    if x1 is not None:
+        predictions.append((x1, y1))
+        method_names.append("Sim1.0")
+
+    # Method 2: Homography center
+    x2, y2, desc2 = method_homography_center(kp_drone, kp_crop, H, mask, crop_offset, drone_shape)
+    if x2 is not None:
+        predictions.append((x2, y2))
+        method_names.append("Homog")
+
+    # Method 3: Affine RANSAC
+    x3, y3, desc3 = method_affine_ransac(kp_drone, kp_crop, H, mask, crop_offset, drone_shape)
+    if x3 is not None:
+        predictions.append((x3, y3))
+        method_names.append("Affine")
+
+    # Need at least one successful prediction
+    if len(predictions) == 0:
+        return None, None, "Top Median (all methods failed)"
+
+    # Take median of x and y coordinates
+    x_coords = [p[0] for p in predictions]
+    y_coords = [p[1] for p in predictions]
+
+    x_median = np.median(x_coords)
+    y_median = np.median(y_coords)
+
+    method_str = "+".join(method_names)
+    return x_median, y_median, f"Top Median ({method_str})"
+
+
+def method_weighted_by_inliers(kp_drone, kp_crop, H, mask, crop_offset, drone_shape):
+    """
+    Ensemble: weighted average by inlier count.
+
+    Combines predictions weighted by their inlier counts:
+    - Similarity thresh=1.0
+    - Homography center
+    - Affine RANSAC
+    - Rough GPS (with fixed weight)
+
+    Higher inlier count = more confidence = higher weight.
+    """
+    import cv2
+    import numpy as np
+
+    h_drone, w_drone = drone_shape
+    center_x, center_y = w_drone / 2, h_drone / 2
+
+    inlier_mask = mask.ravel().astype(bool)
+    inlier_kp_drone = kp_drone[inlier_mask]
+    inlier_kp_crop = kp_crop[inlier_mask]
+
+    predictions = []
+    weights = []
+    method_names = []
+
+    # Method 1: Similarity thresh=1.0
+    if len(inlier_kp_drone) >= 2:
+        src_pts = inlier_kp_drone.astype(np.float32)
+        dst_pts = inlier_kp_crop.astype(np.float32)
+        M_sim, inliers_sim = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=1.0
+        )
+
+        if M_sim is not None and inliers_sim is not None:
+            n_inliers_sim = int(inliers_sim.sum())
+            if n_inliers_sim > 0:
+                center = np.array([[center_x, center_y]], dtype=np.float32)
+                center_transformed = cv2.transform(center.reshape(-1, 1, 2), M_sim).reshape(-1, 2)
+                x_sim, y_sim = center_transformed[0]
+                x_sim += crop_offset[0]
+                y_sim += crop_offset[1]
+
+                predictions.append((x_sim, y_sim))
+                weights.append(n_inliers_sim)
+                method_names.append(f"Sim({n_inliers_sim})")
+
+    # Method 2: Homography center
+    if len(inlier_kp_drone) >= 4:
+        src_pts = inlier_kp_drone.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts = inlier_kp_crop.reshape(-1, 1, 2).astype(np.float32)
+        H_new, mask_new = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+        if H_new is not None and mask_new is not None:
+            n_inliers_hom = int(mask_new.sum())
+            if n_inliers_hom > 0:
+                center = np.float32([[center_x, center_y]]).reshape(-1, 1, 2)
+                proj = cv2.perspectiveTransform(center, H_new)
+                x_hom, y_hom = proj[0, 0, 0], proj[0, 0, 1]
+                x_hom += crop_offset[0]
+                y_hom += crop_offset[1]
+
+                predictions.append((x_hom, y_hom))
+                weights.append(n_inliers_hom)
+                method_names.append(f"Hom({n_inliers_hom})")
+
+    # Method 3: Affine RANSAC
+    if len(inlier_kp_drone) >= 3:
+        src_pts = inlier_kp_drone.astype(np.float32)
+        dst_pts = inlier_kp_crop.astype(np.float32)
+        M_aff, inliers_aff = cv2.estimateAffine2D(
+            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+
+        if M_aff is not None and inliers_aff is not None:
+            n_inliers_aff = int(inliers_aff.sum())
+            if n_inliers_aff > 0:
+                center = np.array([[center_x, center_y]], dtype=np.float32)
+                center_transformed = cv2.transform(center.reshape(-1, 1, 2), M_aff).reshape(-1, 2)
+                x_aff, y_aff = center_transformed[0]
+                x_aff += crop_offset[0]
+                y_aff += crop_offset[1]
+
+                predictions.append((x_aff, y_aff))
+                weights.append(n_inliers_aff)
+                method_names.append(f"Aff({n_inliers_aff})")
+
+    # Method 4: Rough GPS - crop is centered on rough GPS position
+    # Rough GPS gets a fixed weight equivalent to median inlier count
+    CROP_SIZE = 750
+    rough_x = crop_offset[0] + CROP_SIZE / 2
+    rough_y = crop_offset[1] + CROP_SIZE / 2
+
+    # Use median weight of other methods, or 50 if no other methods succeeded
+    rough_weight = np.median(weights) if len(weights) > 0 else 50
+    predictions.append((rough_x, rough_y))
+    weights.append(rough_weight)
+    method_names.append(f"Rough({rough_weight:.0f})")
+
+    if len(predictions) == 0:
+        return None, None, "Weighted by inliers (all failed)"
+
+    # Compute weighted average
+    weights = np.array(weights, dtype=float)
+    weights /= weights.sum()  # Normalize to sum to 1
+
+    x_weighted = sum(w * p[0] for w, p in zip(weights, predictions))
+    y_weighted = sum(w * p[1] for w, p in zip(weights, predictions))
+
+    method_str = "+".join(method_names)
+    return x_weighted, y_weighted, f"Weighted by inliers ({method_str})"
+
+
+def method_best_by_inliers(kp_drone, kp_crop, H, mask, crop_offset, drone_shape):
+    """
+    Ensemble: pick method with most inliers (most confident).
+
+    Runs all three methods and returns the prediction from whichever
+    has the highest inlier count. Includes rough GPS as fallback.
+    """
+    import cv2
+    import numpy as np
+
+    h_drone, w_drone = drone_shape
+    center_x, center_y = w_drone / 2, h_drone / 2
+
+    inlier_mask = mask.ravel().astype(bool)
+    inlier_kp_drone = kp_drone[inlier_mask]
+    inlier_kp_crop = kp_crop[inlier_mask]
+
+    best_prediction = None
+    best_inliers = 0
+    best_method = None
+
+    # Method 1: Similarity thresh=1.0
+    if len(inlier_kp_drone) >= 2:
+        src_pts = inlier_kp_drone.astype(np.float32)
+        dst_pts = inlier_kp_crop.astype(np.float32)
+        M_sim, inliers_sim = cv2.estimateAffinePartial2D(
+            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=1.0
+        )
+
+        if M_sim is not None and inliers_sim is not None:
+            n_inliers_sim = int(inliers_sim.sum())
+            if n_inliers_sim > best_inliers:
+                center = np.array([[center_x, center_y]], dtype=np.float32)
+                center_transformed = cv2.transform(center.reshape(-1, 1, 2), M_sim).reshape(-1, 2)
+                x_sim, y_sim = center_transformed[0]
+                x_sim += crop_offset[0]
+                y_sim += crop_offset[1]
+
+                best_prediction = (x_sim, y_sim)
+                best_inliers = n_inliers_sim
+                best_method = f"Sim({n_inliers_sim})"
+
+    # Method 2: Homography center
+    if len(inlier_kp_drone) >= 4:
+        src_pts = inlier_kp_drone.reshape(-1, 1, 2).astype(np.float32)
+        dst_pts = inlier_kp_crop.reshape(-1, 1, 2).astype(np.float32)
+        H_new, mask_new = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+        if H_new is not None and mask_new is not None:
+            n_inliers_hom = int(mask_new.sum())
+            if n_inliers_hom > best_inliers:
+                center = np.float32([[center_x, center_y]]).reshape(-1, 1, 2)
+                proj = cv2.perspectiveTransform(center, H_new)
+                x_hom, y_hom = proj[0, 0, 0], proj[0, 0, 1]
+                x_hom += crop_offset[0]
+                y_hom += crop_offset[1]
+
+                best_prediction = (x_hom, y_hom)
+                best_inliers = n_inliers_hom
+                best_method = f"Hom({n_inliers_hom})"
+
+    # Method 3: Affine RANSAC
+    if len(inlier_kp_drone) >= 3:
+        src_pts = inlier_kp_drone.astype(np.float32)
+        dst_pts = inlier_kp_crop.astype(np.float32)
+        M_aff, inliers_aff = cv2.estimateAffine2D(
+            src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+
+        if M_aff is not None and inliers_aff is not None:
+            n_inliers_aff = int(inliers_aff.sum())
+            if n_inliers_aff > best_inliers:
+                center = np.array([[center_x, center_y]], dtype=np.float32)
+                center_transformed = cv2.transform(center.reshape(-1, 1, 2), M_aff).reshape(-1, 2)
+                x_aff, y_aff = center_transformed[0]
+                x_aff += crop_offset[0]
+                y_aff += crop_offset[1]
+
+                best_prediction = (x_aff, y_aff)
+                best_inliers = n_inliers_aff
+                best_method = f"Aff({n_inliers_aff})"
+
+    # Fallback to rough GPS if all methods failed
+    if best_prediction is None:
+        CROP_SIZE = 750
+        rough_x = crop_offset[0] + CROP_SIZE / 2
+        rough_y = crop_offset[1] + CROP_SIZE / 2
+        return rough_x, rough_y, "Best by inliers (Rough fallback)"
+
+    return best_prediction[0], best_prediction[1], f"Best by inliers ({best_method})"
+
+
 if __name__ == "__main__":
     main()

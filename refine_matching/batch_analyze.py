@@ -49,6 +49,9 @@ from analyze_matches import (
     method_iterative_similarity,
     method_weighted_similarity,
     method_local_similarity,
+    method_top_median,
+    method_weighted_by_inliers,
+    method_best_by_inliers,
 )
 
 
@@ -124,10 +127,19 @@ def main():
 
     print(f"Using random sample of {sample_size} images for analysis")
 
-    matcher = 'master'  # Only Master matcher
+    # Get matcher from command line or default to master
+    import sys
+    matcher = 'master'  # Default
+    if len(sys.argv) > 1 and sys.argv[1].startswith('--matcher='):
+        matcher = sys.argv[1].split('=')[1]
+
+    print(f"Matcher: {matcher}")
 
     # Define methods to test (using lambdas for parameterized methods)
     methods_to_test = [
+        ("Top Median (Sim+Hom+Aff)", method_top_median),
+        ("Weighted by inliers", method_weighted_by_inliers),
+        ("Best by inliers", method_best_by_inliers),
         ("Homography center", method_homography_center),
         ("Median transform", method_median_transform),
         ("Mean transform", method_mean_transform),
@@ -344,20 +356,21 @@ def main():
     print("="*135)
 
 
-def generate_refined_predictions():
+def generate_refined_predictions(matcher='master'):
     """
-    Generate refined predictions for all train and test images using Homography center method.
+    Generate refined predictions for all train and test images using Similarity thresh=1.0 method.
 
-    Reads match data from match_visualizations/img_XXXX/master_matches.npz
+    Reads match data from match_visualizations/img_XXXX/{matcher}_matches.npz
     and writes refined predictions to:
-      - refine_matching/train_predictions.csv
-      - refine_matching/test_predicted.csv
+      - refine_matching/train_predictions_{matcher}.csv
+      - refine_matching/test_predicted_{matcher}.csv
     """
     import csv
 
     print("="*100)
     print("GENERATING REFINED PREDICTIONS")
-    print("Method: Homography center")
+    print(f"Matcher: {matcher}")
+    print("Method: Similarity thresh=1.0")
     print("="*100)
 
     root_dir = Path(__file__).parent.parent
@@ -390,7 +403,7 @@ def generate_refined_predictions():
 
     print("Processing train images...")
     for img_id in train_ids:
-        match_file = match_dir_root / f"img_{img_id:04d}" / "master_matches.npz"
+        match_file = match_dir_root / f"img_{img_id:04d}" / f"{matcher}_matches.npz"
 
         if not match_file.exists():
             print(f"  ✗ Image {img_id:04d}: No match data found")
@@ -407,9 +420,9 @@ def generate_refined_predictions():
         drone_shape = tuple(data['drone_shape'])
         rough_x, rough_y = data['rough_position']
 
-        # Apply homography center method
-        x_refined, y_refined, description = method_homography_center(
-            kp_drone, kp_crop, H, mask, crop_offset, drone_shape
+        # Apply similarity thresh=1.0 method
+        x_refined, y_refined, description = method_similarity_ransac_thresh(
+            kp_drone, kp_crop, H, mask, crop_offset, drone_shape, threshold=1.0
         )
 
         # Validation: reject refinements that move more than 140px from rough GPS
@@ -451,7 +464,7 @@ def generate_refined_predictions():
 
     print("\nProcessing test images...")
     for img_id in test_ids:
-        match_file = match_dir_root / f"img_{img_id:04d}" / "master_matches.npz"
+        match_file = match_dir_root / f"img_{img_id:04d}" / f"{matcher}_matches.npz"
 
         if not match_file.exists():
             print(f"  ✗ Image {img_id:04d}: No match data found")
@@ -468,9 +481,9 @@ def generate_refined_predictions():
         drone_shape = tuple(data['drone_shape'])
         rough_x, rough_y = data['rough_position']
 
-        # Apply homography center method
-        x_refined, y_refined, description = method_homography_center(
-            kp_drone, kp_crop, H, mask, crop_offset, drone_shape
+        # Apply similarity thresh=1.0 method
+        x_refined, y_refined, description = method_similarity_ransac_thresh(
+            kp_drone, kp_crop, H, mask, crop_offset, drone_shape, threshold=1.0
         )
 
         # Validation: reject refinements that move more than 140px from rough GPS
@@ -499,7 +512,8 @@ def generate_refined_predictions():
         test_results.append({'id': img_id, 'x_pixel': x_map, 'y_pixel': y_map})
 
     # Write train predictions
-    train_output = Path(__file__).parent / "train_predictions.csv"
+    suffix = f"_{matcher}" if matcher != 'master' else ""
+    train_output = Path(__file__).parent / f"train_predictions{suffix}.csv"
     with open(train_output, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['id', 'x_pixel', 'y_pixel'])
         writer.writeheader()
@@ -508,7 +522,7 @@ def generate_refined_predictions():
     print(f"\n✓ Wrote train predictions to: {train_output}")
 
     # Write test predictions
-    test_output = Path(__file__).parent / "test_predicted.csv"
+    test_output = Path(__file__).parent / f"test_predicted{suffix}.csv"
     with open(test_output, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['id', 'x_pixel', 'y_pixel'])
         writer.writeheader()
@@ -705,10 +719,16 @@ def generate_raw_refined_predictions():
 if __name__ == "__main__":
     import sys
 
+    # Parse matcher parameter
+    matcher = 'master'
+    for arg in sys.argv[1:]:
+        if arg.startswith('--matcher='):
+            matcher = arg.split('=')[1]
+
     # Check for flags
-    if len(sys.argv) > 1 and sys.argv[1] == "--refine":
-        generate_refined_predictions()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--raw":
+    if '--refine' in sys.argv:
+        generate_refined_predictions(matcher=matcher)
+    elif '--raw' in sys.argv:
         generate_raw_refined_predictions()
     else:
         main()

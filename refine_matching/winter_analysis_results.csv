@@ -1,0 +1,4 @@
+id,original_error_px,winter_error_px,degradation_px,degradation_percent,n_matches,n_inliers_homography,n_inliers_similarity,success,method_description
+13,40.80569563331236,inf,inf,inf,0,0,0,False,MASt3R matching failed
+15,30.958470457010105,inf,inf,inf,0,0,0,False,MASt3R matching failed
+40,24.126134199413254,51.878157420456844,27.75202322104359,115.02888523980157,524,157,15,False,Similarity thresh=1.0 (15 inliers) - FAILED VALIDATION

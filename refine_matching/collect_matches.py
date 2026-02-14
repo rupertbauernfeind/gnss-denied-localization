@@ -555,16 +555,50 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
     output_dir = Path(__file__).parent / "match_visualizations" / f"img_{img_id:04d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try Master (MASt3R) via vismatch only
+    # Try SE2-LoFTR only (Master already collected)
     matchers_results = []
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    print("\n--- Master (via vismatch) ---")
+    # Skip Master - already collected
+    # print("\n--- Master (via vismatch) ---")
+    # try:
+    #     result = try_vismatch(gray_drone, gray_crop, 'master', device=device)
+    #     if result is not None:
+    #         kp_drone, kp_crop, kp_viz, H, mask, n_inliers = result
+    #         print(f"  ✓ Master: {n_inliers} inliers")
+    #
+    #         # Prepare NPZ data
+    #         npz_data = {
+    #             'kp_drone': kp_drone,
+    #             'kp_crop': kp_crop,
+    #             'H': H,
+    #             'mask': mask,
+    #             'n_inliers': n_inliers,
+    #             'crop_offset': np.array([x0, y0]),
+    #             'drone_shape': gray_drone.shape,
+    #             'rough_position': np.array([rough_x, rough_y])
+    #         }
+    #         # Add ground truth only if available
+    #         if has_gt:
+    #             npz_data['gt_position'] = np.array([gt_x, gt_y])
+    #
+    #         np.savez(output_dir / "master_matches.npz", **npz_data)
+    #         vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, "Master", n_inliers)
+    #         cv2.imwrite(str(output_dir / "master_visualization.png"), vis_img)
+    #         matchers_results.append(("Master", n_inliers))
+    #     else:
+    #         print(f"  ✗ Master failed")
+    # except Exception as e:
+    #     print(f"  ✗ Master error: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+
+    print("\n--- SE2-LoFTR (via vismatch) ---")
     try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        result = try_vismatch(gray_drone, gray_crop, 'master', device=device)
+        result = try_vismatch(gray_drone, gray_crop, 'se2loftr', device=device)
         if result is not None:
             kp_drone, kp_crop, kp_viz, H, mask, n_inliers = result
-            print(f"  ✓ Master: {n_inliers} inliers")
+            print(f"  ✓ SE2-LoFTR: {n_inliers} inliers")
 
             # Prepare NPZ data
             npz_data = {
@@ -581,14 +615,14 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
             if has_gt:
                 npz_data['gt_position'] = np.array([gt_x, gt_y])
 
-            np.savez(output_dir / "master_matches.npz", **npz_data)
-            vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, "Master", n_inliers)
-            cv2.imwrite(str(output_dir / "master_visualization.png"), vis_img)
-            matchers_results.append(("Master", n_inliers))
+            np.savez(output_dir / "se2loftr_matches.npz", **npz_data)
+            vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, "SE2-LoFTR", n_inliers)
+            cv2.imwrite(str(output_dir / "se2loftr_visualization.png"), vis_img)
+            matchers_results.append(("SE2-LoFTR", n_inliers))
         else:
-            print(f"  ✗ Master failed")
+            print(f"  ✗ SE2-LoFTR failed")
     except Exception as e:
-        print(f"  ✗ Master error: {e}")
+        print(f"  ✗ SE2-LoFTR error: {e}")
         import traceback
         traceback.print_exc()
 
@@ -600,7 +634,12 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
         print(f"  Rough GPS Error: {rough_err:.1f}px")
     else:
         print(f"  Rough GPS: ({rough_x:.1f}, {rough_y:.1f}) [No ground truth]")
-    print(f"  Master (via vismatch): {matchers_results[0][1] if matchers_results else 0} inliers")
+
+    # Display results for each matcher
+    master_inliers = next((inliers for name, inliers in matchers_results if name == "Master"), 0)
+    se2loftr_inliers = next((inliers for name, inliers in matchers_results if name == "SE2-LoFTR"), 0)
+    print(f"  Master (via vismatch): {master_inliers} inliers")
+    print(f"  SE2-LoFTR (via vismatch): {se2loftr_inliers} inliers")
     print(f"{'='*80}")
 
     return len(matchers_results) > 0
