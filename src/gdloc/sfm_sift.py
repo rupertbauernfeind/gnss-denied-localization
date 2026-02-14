@@ -848,11 +848,108 @@ class SFM_Sift:
             )
 
         out = pd.DataFrame(rows)
+        out["pred_x_model"] = out["pred_x"]
+        out["pred_y_model"] = out["pred_y"]
+        out["err_model_px"] = out["err_px"]
+
+        # Notebook-16 style: derive global path from accumulated relative center positions.
+        # For validation on train ranges this usually gives a more stable global trajectory.
+        t_to_anchor: Dict[int, np.ndarray] = {int(ids[0]): np.eye(3, dtype=np.float64)}
+        for prev_id, curr_id in zip(ids[:-1], ids[1:]):
+            m = self._estimate_pair_motion(prev_id, curr_id)
+            if (m.affine_M_1to0 is not None) and (m.affine_inliers >= int(self.cfg.seq_min_affine_inliers)):
+                m_used = m.affine_M_1to0.astype(np.float64)
+            else:
+                m_used = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+            h_curr_to_prev = self._affine2x3_to_hom(m_used)
+            t_to_anchor[curr_id] = t_to_anchor[prev_id] @ h_curr_to_prev
+
+        anchor_id = int(ids[0])
+        anchor_gray, _ = self._load_preprocessed_gray(
+            anchor_id,
+            max_side=self.cfg.image_max_side,
+            mode=self.cfg.preprocess_mode,
+        )
+        ah, aw = anchor_gray.shape[:2]
+        anchor_center = np.array([aw * 0.5, ah * 0.5], dtype=np.float32)
+
+        rel_by_id: Dict[int, np.ndarray] = {}
+        for iid in ids:
+            gray, _ = self._load_preprocessed_gray(
+                iid,
+                max_side=self.cfg.image_max_side,
+                mode=self.cfg.preprocess_mode,
+            )
+            h, w = gray.shape[:2]
+            center = np.array([[w * 0.5, h * 0.5]], dtype=np.float32)
+            center_anchor = self._transform_points_hom(t_to_anchor[iid], center)[0]
+            rel_by_id[iid] = (center_anchor - anchor_center).astype(np.float64)
+
+        gt_by_id = {iid: self._get_ground_truth(iid) for iid in ids}
+        known_by_id = {iid: self._get_known_position(iid) for iid in ids}
+
+        anchor_pose = gt_by_id[anchor_id] if gt_by_id[anchor_id] is not None else known_by_id[anchor_id]
+        ref_idx = None
+        cal_source = "none"
+        cal_scale = 1.0
+        cal_angle = 0.0
+
+        if anchor_pose is not None:
+            if gt_by_id[anchor_id] is not None:
+                cal_source = "gt"
+                ref_poses = gt_by_id
+            else:
+                cal_source = "known"
+                ref_poses = known_by_id
+
+            for i in range(1, len(ids)):
+                ref_id = int(ids[i])
+                ref_pose = ref_poses.get(ref_id)
+                if ref_pose is None:
+                    continue
+                rel = rel_by_id[ref_id]
+                nr = float(np.linalg.norm(rel))
+                ng = float(np.linalg.norm(ref_pose - anchor_pose))
+                if nr > 1e-6 and ng > 1e-6:
+                    cal_scale = ng / nr
+                    cal_angle = float(
+                        np.arctan2((ref_pose - anchor_pose)[1], (ref_pose - anchor_pose)[0]) - np.arctan2(rel[1], rel[0])
+                    )
+                    ref_idx = i
+                    break
+
+        if anchor_pose is not None:
+            r_cal = self._build_rot(cal_angle)
+            geom_pred_by_id = {
+                iid: (anchor_pose + (r_cal @ rel_by_id[iid]) * cal_scale).astype(np.float64)
+                for iid in ids
+            }
+        else:
+            geom_pred_by_id = {}
+
+        out["pred_x_geom"] = out["target_id"].map(lambda iid: float(geom_pred_by_id[iid][0]) if int(iid) in geom_pred_by_id else np.nan)
+        out["pred_y_geom"] = out["target_id"].map(lambda iid: float(geom_pred_by_id[iid][1]) if int(iid) in geom_pred_by_id else np.nan)
+        out["global_mode"] = "model"
+        use_geom = np.isfinite(out["pred_x_geom"]) & np.isfinite(out["pred_y_geom"])
+        out.loc[use_geom, "pred_x"] = out.loc[use_geom, "pred_x_geom"]
+        out.loc[use_geom, "pred_y"] = out.loc[use_geom, "pred_y_geom"]
+        out.loc[use_geom, "global_mode"] = "overlay_calibrated"
+        out["err_px"] = np.sqrt((out["pred_x"] - out["gt_x"]) ** 2 + (out["pred_y"] - out["gt_y"]) ** 2)
+        out.attrs["overlay_calibration"] = {
+            "source": cal_source,
+            "anchor_id": anchor_id,
+            "ref_id": int(ids[ref_idx]) if ref_idx is not None else None,
+            "scale": float(cal_scale),
+            "yaw_deg": float(np.degrees(cal_angle)),
+        }
+
         if len(errors) > 0:
             print(
                 f"Validation range [{start_id}, {end_id}] | "
-                f"train frames={len(errors)} | mean_err={np.mean(errors):.2f}px | "
-                f"median_err={np.median(errors):.2f}px"
+                f"train frames={len(errors)} | mean_err={np.nanmean(out['err_px']):.2f}px | "
+                f"median_err={np.nanmedian(out['err_px']):.2f}px | "
+                f"model_mean_err={np.nanmean(out['err_model_px']):.2f}px | "
+                f"global_mode={'overlay_calibrated' if bool(np.any(use_geom)) else 'model'}"
             )
         else:
             print(f"Validation range [{start_id}, {end_id}] | no train frames in interval.")
@@ -1055,7 +1152,7 @@ class SFM_Sift:
         q = (h_mat @ p.T).T
         return (q[:, :2] / np.clip(q[:, 2:3], 1e-12, None)).astype(np.float32)
 
-    def _pose_for_plot(self, image_id: int, validation: bool) -> np.ndarray:
+    def _pose_for_plot_optional(self, image_id: int, validation: bool) -> Optional[np.ndarray]:
         pred = self._get_prediction(int(image_id))
         gt = self._get_ground_truth(int(image_id))
         if validation:
@@ -1063,12 +1160,28 @@ class SFM_Sift:
                 return pred
             if gt is not None:
                 return gt
-            raise AssertionError(f"id={image_id} has neither prediction nor ground truth.")
+            return None
         if gt is not None:
             return gt
         if pred is not None:
             return pred
-        raise AssertionError(f"id={image_id} has neither prediction nor ground truth.")
+        return None
+
+    def _pose_for_plot(self, image_id: int, validation: bool) -> np.ndarray:
+        p = self._pose_for_plot_optional(image_id, validation=validation)
+        if p is None:
+            raise AssertionError(f"id={image_id} has neither prediction nor ground truth.")
+        return p
+
+    @staticmethod
+    def _build_rot(theta: float) -> np.ndarray:
+        return np.array(
+            [
+                [np.cos(theta), -np.sin(theta)],
+                [np.sin(theta), np.cos(theta)],
+            ],
+            dtype=np.float64,
+        )
 
     def plot_range(self, start_id: int, end_id: int, validation: bool = False) -> None:
         self._require_dataset()
@@ -1085,7 +1198,7 @@ class SFM_Sift:
                 max_side=self.cfg.image_max_side,
                 mode=self.cfg.preprocess_mode,
             )
-            pose_xy = self._pose_for_plot(iid, validation=validation)
+            pose_xy = self._pose_for_plot_optional(iid, validation=validation)
             seq_data[iid] = {"gray": gray, "pose": pose_xy}
 
         t_to_anchor: Dict[int, np.ndarray] = {int(ids[0]): np.eye(3, dtype=np.float64)}
@@ -1145,21 +1258,121 @@ class SFM_Sift:
             overlay[mask] = (1.0 - alpha) * overlay[mask] + alpha * layer[mask]
         overlay = np.clip(overlay, 0.0, 1.0)
 
-        poses = np.array([self._pose_for_plot(iid, validation=validation) for iid in ids], dtype=np.float64)
+        # Build center tracks in anchor/canvas frame and calibrate to global map space.
+        anchor_id = int(ids[0])
+        anchor_gray = seq_data[anchor_id]["gray"]
+        ah, aw = anchor_gray.shape[:2]
+        anchor_center = np.array([aw * 0.5, ah * 0.5], dtype=np.float32)
+
+        center_canvas_list: List[np.ndarray] = []
+        rel_anchor_list: List[np.ndarray] = []
+        pose_used_list: List[Optional[np.ndarray]] = []
+
+        for iid in ids:
+            gray = seq_data[iid]["gray"]
+            h, w = gray.shape[:2]
+            center = np.array([[w * 0.5, h * 0.5]], dtype=np.float32)
+            center_anchor = self._transform_points_hom(t_to_anchor[iid], center)[0]
+            center_canvas = self._transform_points_hom(t_to_canvas[iid], center)[0]
+
+            rel = (center_anchor - anchor_center).astype(np.float64)
+            pose_used = seq_data[iid]["pose"]
+
+            center_canvas_list.append(center_canvas.astype(np.float64))
+            rel_anchor_list.append(rel)
+            pose_used_list.append(None if pose_used is None else np.asarray(pose_used, dtype=np.float64))
+
+        gt_pose_list: List[Optional[np.ndarray]] = [self._get_ground_truth(iid) for iid in ids]
+        anchor_pose = gt_pose_list[0] if gt_pose_list[0] is not None else pose_used_list[0]
+        if anchor_pose is None:
+            raise AssertionError(
+                f"id={anchor_id} has no pose for global calibration. "
+                "Run forward_range/forward_test_set first or use validation mode with train ids."
+            )
+
+        cal_scale = 1.0
+        cal_angle = 0.0
+        ref_idx = None
+        cal_source = "gt" if gt_pose_list[0] is not None else "pose"
+        ref_pose_list = gt_pose_list if gt_pose_list[0] is not None else pose_used_list
+        for i in range(1, len(ids)):
+            ref_pose = ref_pose_list[i]
+            rel = rel_anchor_list[i]
+            if ref_pose is None:
+                continue
+            nr = float(np.linalg.norm(rel))
+            ng = float(np.linalg.norm(ref_pose - anchor_pose))
+            if nr > 1e-6 and ng > 1e-6:
+                cal_scale = ng / nr
+                cal_angle = float(np.arctan2((ref_pose - anchor_pose)[1], (ref_pose - anchor_pose)[0]) - np.arctan2(rel[1], rel[0]))
+                ref_idx = i
+                break
+
+        r_cal = self._build_rot(cal_angle)
+        overlay_global = np.array(
+            [anchor_pose + (r_cal @ rel) * cal_scale for rel in rel_anchor_list],
+            dtype=np.float64,
+        )
+
+        pose_used_xy = np.array(
+            [p if p is not None else np.array([np.nan, np.nan], dtype=np.float64) for p in pose_used_list],
+            dtype=np.float64,
+        )
         gt_xy = np.array([self._train_pos_map[iid] for iid in ids if iid in self._train_pos_map], dtype=np.float64)
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         axes[0].imshow(overlay)
-        axes[0].set_title(f"Merged range {ids[0]} -> {ids[-1]}")
+        axes[0].set_title(f"Merged range {ids[0]} -> {ids[-1]} (center anchors)")
         axes[0].axis("off")
 
-        axes[1].plot(poses[:, 0], poses[:, 1], "-o", color="crimson", markersize=4, linewidth=1.5, label="pose used")
+        center_canvas_np = np.vstack(center_canvas_list).astype(np.float64)
+        axes[0].plot(center_canvas_np[:, 0], center_canvas_np[:, 1], "-", color="white", linewidth=1.1, alpha=0.85)
+        for i, iid in enumerate(ids):
+            c = colors[i % len(colors)] / 255.0
+            p = center_canvas_np[i]
+            axes[0].scatter(p[0], p[1], s=115, c=[c], edgecolors="black", linewidths=0.8, zorder=3)
+            axes[0].text(
+                p[0] + 8.0,
+                p[1] + 8.0,
+                f"{i}:{iid}",
+                color="white",
+                fontsize=8,
+                zorder=4,
+            )
+
+        axes[1].plot(
+            overlay_global[:, 0],
+            overlay_global[:, 1],
+            "-o",
+            color="crimson",
+            markersize=4,
+            linewidth=1.7,
+            label="overlay-calibrated",
+        )
+        valid_used = np.isfinite(pose_used_xy[:, 0]) & np.isfinite(pose_used_xy[:, 1])
+        if np.any(valid_used):
+            axes[1].plot(
+                pose_used_xy[valid_used, 0],
+                pose_used_xy[valid_used, 1],
+                "--o",
+                color="orange",
+                markersize=3.5,
+                linewidth=1.2,
+                alpha=0.85,
+                label="pose used (raw)",
+            )
         if gt_xy.shape[0] > 0:
             axes[1].scatter(gt_xy[:, 0], gt_xy[:, 1], s=22, c="deepskyblue", alpha=0.7, label="train GT")
-        axes[1].set_title("Map trajectory")
+        for i, iid in enumerate(ids):
+            axes[1].text(overlay_global[i, 0] + 6.0, overlay_global[i, 1] + 6.0, str(iid), color="crimson", fontsize=7)
+        cal_note = "ref=none"
+        if ref_idx is not None:
+            cal_note = f"{cal_source} ref={ids[ref_idx]} scale={cal_scale:.3f} yaw={np.degrees(cal_angle):.2f}deg"
+        axes[1].set_title(f"Map trajectory ({cal_note})")
         axes[1].set_xlabel("x_pixel")
         axes[1].set_ylabel("y_pixel")
         axes[1].invert_yaxis()
+        axes[1].set_aspect("equal", adjustable="box")
         axes[1].legend(loc="best")
         axes[1].grid(alpha=0.3)
 
