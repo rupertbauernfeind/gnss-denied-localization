@@ -90,8 +90,8 @@ def read_rotation_from_xmp(xmp_path):
             values = list(map(float, rotation_elem.text.split()))
             if len(values) == 9:
                 return np.array(values).reshape(3, 3)
-    except Exception as e:
-        print(f"Warning: Could not read rotation from {xmp_path}: {e}")
+    except Exception:
+        pass  # Silently fail if rotation data not available
     return None
 
 
@@ -280,7 +280,7 @@ def try_loftr(gray_drone, gray_crop, conf_thresh=0.5):
     return mkpts0, mkpts1, None, H, mask, n_inliers
 
 
-def try_vismatch(gray_drone, gray_crop, matcher_name, device='cpu'):
+def try_vismatch(gray_drone, gray_crop, matcher, device='cpu'):
     """Run vismatch matcher (XoFTR)."""
     if not VISMATCH_AVAILABLE:
         return None
@@ -301,8 +301,6 @@ def try_vismatch(gray_drone, gray_crop, matcher_name, device='cpu'):
         cv2.imwrite(crop_path, crop_padded)
 
         try:
-            matcher = get_matcher(matcher_name, device=device)
-
             # Load WITHOUT vismatch's internal resizing (already 512×512)
             img0 = matcher.load_image(drone_path, resize=None)
             img1 = matcher.load_image(crop_path, resize=None)
@@ -475,8 +473,8 @@ def visualize_matches(drone_img, map_crop, kp_drone, kp_crop, mask, matcher_name
     return vis
 
 
-def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, image_type='train'):
-    """Collect matches from all matchers for one image.
+def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, matcher, matcher_key, matcher_display_name, device, image_type='train'):
+    """Collect matches from one matcher for one image.
 
     Args:
         img_id: Image ID number
@@ -484,16 +482,15 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
         rough_dict: Dictionary of rough GPS predictions
         gt_dict: Dictionary of ground truth positions (can be None for test images)
         full_map: Full satellite map image
+        matcher: Pre-loaded vismatch matcher instance
+        matcher_key: Matcher key (e.g., 'rdd-star')
+        matcher_display_name: Matcher display name (e.g., 'RDD-Star')
+        device: Device to use ('cuda' or 'cpu')
         image_type: 'train' or 'test'
     """
-    print(f"\n{'='*80}")
-    print(f"Processing Image {img_id:04d} ({image_type.upper()})")
-    print(f"{'='*80}")
-
     # Check if we have rough GPS for this image
     if img_id not in rough_dict:
-        print(f"  ✗ Skipping image {img_id:04d}: missing rough GPS")
-        return False
+        return False, 0
 
     rough_x, rough_y = rough_dict[img_id]
 
@@ -501,37 +498,22 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
     has_gt = gt_dict is not None and img_id in gt_dict
     if has_gt:
         gt_x, gt_y = gt_dict[img_id]
-        rough_err = math.sqrt((rough_x - gt_x)**2 + (rough_y - gt_y)**2)
-        print(f"Ground Truth: ({gt_x:.1f}, {gt_y:.1f})")
-        print(f"Rough GPS:    ({rough_x:.1f}, {rough_y:.1f}) - Error: {rough_err:.1f}px")
-    else:
-        print(f"Rough GPS:    ({rough_x:.1f}, {rough_y:.1f})")
 
     # Load drone image
     image_dir = root_dir / "data" / f"{image_type}_data" / f"{image_type}_images"
     drone_img = cv2.imread(str(image_dir / f"{img_id:04d}.JPG"))
     if drone_img is None:
-        print(f"  ✗ Skipping image {img_id:04d}: failed to load drone image")
-        return False
+        return False, 0
 
     h_orig, w_orig = drone_img.shape[:2]
-    print(f"  Drone image: {w_orig}x{h_orig}")
 
     # Load and apply rotation correction
     xmp_path = root_dir / "rough_matching" / "realityscan_positions" / image_type / f"{img_id:04d}.xmp"
     rotation_matrix = read_rotation_from_xmp(xmp_path)
 
     if rotation_matrix is not None:
-        roll_deg = math.degrees(math.atan2(rotation_matrix[2, 1], rotation_matrix[2, 2]))
-        yaw_deg = rotation_matrix_to_yaw(rotation_matrix)
-        print(f"  Camera rotation: yaw={yaw_deg:.1f}°, roll={roll_deg:.1f}°")
-        print(f"  Applying rotation correction...")
-
         drone_img = rotate_image_with_matrix(drone_img, rotation_matrix, compensate_roll=True)
         h_orig, w_orig = drone_img.shape[:2]
-        print(f"  Rotated drone image: {w_orig}x{h_orig}")
-    else:
-        print(f"  Warning: No rotation data found, proceeding without correction")
 
     # Resize drone for feature matching
     resize_w = 800
@@ -549,56 +531,15 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
     map_crop = full_map[y0 : y0 + CROP_SIZE, x0 : x0 + CROP_SIZE]
     gray_crop = cv2.cvtColor(map_crop, cv2.COLOR_BGR2GRAY)
 
-    print(f"Crop offset: ({x0}, {y0})")
-
     # Create output directory for this image
     output_dir = Path(__file__).parent / "match_visualizations" / f"img_{img_id:04d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try SE2-LoFTR only (Master already collected)
-    matchers_results = []
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # Skip Master - already collected
-    # print("\n--- Master (via vismatch) ---")
-    # try:
-    #     result = try_vismatch(gray_drone, gray_crop, 'master', device=device)
-    #     if result is not None:
-    #         kp_drone, kp_crop, kp_viz, H, mask, n_inliers = result
-    #         print(f"  ✓ Master: {n_inliers} inliers")
-    #
-    #         # Prepare NPZ data
-    #         npz_data = {
-    #             'kp_drone': kp_drone,
-    #             'kp_crop': kp_crop,
-    #             'H': H,
-    #             'mask': mask,
-    #             'n_inliers': n_inliers,
-    #             'crop_offset': np.array([x0, y0]),
-    #             'drone_shape': gray_drone.shape,
-    #             'rough_position': np.array([rough_x, rough_y])
-    #         }
-    #         # Add ground truth only if available
-    #         if has_gt:
-    #             npz_data['gt_position'] = np.array([gt_x, gt_y])
-    #
-    #         np.savez(output_dir / "master_matches.npz", **npz_data)
-    #         vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, "Master", n_inliers)
-    #         cv2.imwrite(str(output_dir / "master_visualization.png"), vis_img)
-    #         matchers_results.append(("Master", n_inliers))
-    #     else:
-    #         print(f"  ✗ Master failed")
-    # except Exception as e:
-    #     print(f"  ✗ Master error: {e}")
-    #     import traceback
-    #     traceback.print_exc()
-
-    print("\n--- SE2-LoFTR (via vismatch) ---")
+    # Run the matcher
     try:
-        result = try_vismatch(gray_drone, gray_crop, 'se2loftr', device=device)
+        result = try_vismatch(gray_drone, gray_crop, matcher, device=device)
         if result is not None:
             kp_drone, kp_crop, kp_viz, H, mask, n_inliers = result
-            print(f"  ✓ SE2-LoFTR: {n_inliers} inliers")
 
             # Prepare NPZ data
             npz_data = {
@@ -615,34 +556,16 @@ def collect_matches_for_image(img_id, root_dir, rough_dict, gt_dict, full_map, i
             if has_gt:
                 npz_data['gt_position'] = np.array([gt_x, gt_y])
 
-            np.savez(output_dir / "se2loftr_matches.npz", **npz_data)
-            vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, "SE2-LoFTR", n_inliers)
-            cv2.imwrite(str(output_dir / "se2loftr_visualization.png"), vis_img)
-            matchers_results.append(("SE2-LoFTR", n_inliers))
+            # Save with matcher-specific filename
+            np.savez(output_dir / f"{matcher_key}_matches.npz", **npz_data)
+            vis_img = visualize_matches(drone_small, map_crop, kp_drone, kp_crop, mask, matcher_display_name, n_inliers)
+            cv2.imwrite(str(output_dir / f"{matcher_key}_visualization.png"), vis_img)
+
+            return True, n_inliers
         else:
-            print(f"  ✗ SE2-LoFTR failed")
-    except Exception as e:
-        print(f"  ✗ SE2-LoFTR error: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # Summary
-    print(f"\n{'='*80}")
-    print(f"Image {img_id:04d} Summary:")
-    if has_gt:
-        print(f"  Ground Truth: ({gt_x:.1f}, {gt_y:.1f})")
-        print(f"  Rough GPS Error: {rough_err:.1f}px")
-    else:
-        print(f"  Rough GPS: ({rough_x:.1f}, {rough_y:.1f}) [No ground truth]")
-
-    # Display results for each matcher
-    master_inliers = next((inliers for name, inliers in matchers_results if name == "Master"), 0)
-    se2loftr_inliers = next((inliers for name, inliers in matchers_results if name == "SE2-LoFTR"), 0)
-    print(f"  Master (via vismatch): {master_inliers} inliers")
-    print(f"  SE2-LoFTR (via vismatch): {se2loftr_inliers} inliers")
-    print(f"{'='*80}")
-
-    return len(matchers_results) > 0
+            return False, 0
+    except Exception:
+        return False, 0
 
 
 def main():
@@ -651,6 +574,11 @@ def main():
     print("BATCH MATCH COLLECTION - ALL TRAIN & TEST IMAGES")
     print(f"Crop size: {CROP_SIZE}x{CROP_SIZE} pixels")
     print("="*80)
+
+    # Check vismatch availability
+    if not VISMATCH_AVAILABLE:
+        print("✗ vismatch not available!")
+        return
 
     # Load data once
     root = Path(__file__).parent.parent
@@ -683,71 +611,89 @@ def main():
 
     print(f"\nTotal images to process: {len(image_types)} ({len(train_rough_dict)} train + {len(test_rough_dict)} test)")
 
-    # Process all images
-    train_successful = 0
-    train_failed = 0
-    test_successful = 0
-    test_failed = 0
+    # Define matchers to run
+    matchers_to_run = [
+        ('ufm', 'UFM'),
+        ('minima-superpoint-lightglue', 'Minima-SuperPoint-LightGlue')
+    ]
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
 
     all_image_ids = sorted(image_types.keys())
 
-    # Process all images with progress bar
-    pbar = tqdm(all_image_ids, desc="Processing images", unit="img")
-    for img_id in pbar:
-        img_type = image_types[img_id]
-        rough_dict = train_rough_dict if img_type == 'train' else test_rough_dict
+    # Process each matcher separately (load once, process all images)
+    for matcher_key, matcher_display_name in matchers_to_run:
+        print("\n" + "="*80)
+        print(f"PROCESSING MATCHER: {matcher_display_name}")
+        print("="*80)
 
-        # Update progress bar description
-        pbar.set_description(f"Processing {img_id:04d} ({img_type})")
-
+        # Load matcher once for all images
         try:
-            success = collect_matches_for_image(
-                img_id, root, rough_dict, gt_dict, full_map, image_type=img_type
-            )
-            if success:
-                if img_type == 'train':
-                    train_successful += 1
+            print(f"Loading {matcher_display_name} model...")
+            matcher = get_matcher(matcher_key, device=device)
+            print(f"  ✓ {matcher_display_name} loaded successfully")
+        except Exception as e:
+            print(f"  ✗ Failed to load {matcher_display_name}: {e}")
+            continue
+
+        # Track results for this matcher
+        train_successful = 0
+        train_failed = 0
+        test_successful = 0
+        test_failed = 0
+
+        # Process all images with this matcher
+        pbar = tqdm(all_image_ids, desc=f"{matcher_display_name}", unit="img")
+        for img_id in pbar:
+            img_type = image_types[img_id]
+            rough_dict = train_rough_dict if img_type == 'train' else test_rough_dict
+
+            try:
+                success, n_inliers = collect_matches_for_image(
+                    img_id, root, rough_dict, gt_dict, full_map,
+                    matcher, matcher_key, matcher_display_name, device,
+                    image_type=img_type
+                )
+                if success:
+                    if img_type == 'train':
+                        train_successful += 1
+                    else:
+                        test_successful += 1
                 else:
-                    test_successful += 1
-            else:
+                    if img_type == 'train':
+                        train_failed += 1
+                    else:
+                        test_failed += 1
+            except Exception as e:
+                print(f"\n✗ Error processing image {img_id:04d}: {e}")
                 if img_type == 'train':
                     train_failed += 1
                 else:
                     test_failed += 1
-        except Exception as e:
-            print(f"\n✗ Error processing image {img_id:04d}: {e}")
-            import traceback
-            traceback.print_exc()
-            if img_type == 'train':
-                train_failed += 1
-            else:
-                test_failed += 1
 
-        # Update progress bar postfix with current stats
-        pbar.set_postfix({
-            'train_ok': train_successful,
-            'train_fail': train_failed,
-            'test_ok': test_successful,
-            'test_fail': test_failed
-        })
+            # Update progress bar with current stats
+            pbar.set_postfix({
+                'train_ok': train_successful,
+                'test_ok': test_successful,
+                'fail': train_failed + test_failed
+            })
+
+        # Summary for this matcher
+        total_train = len(train_rough_dict)
+        total_test = len(test_rough_dict)
+        print(f"\n{matcher_display_name} Results:")
+        print(f"  Train: {train_successful}/{total_train} successful, {train_failed} failed")
+        print(f"  Test:  {test_successful}/{total_test} successful, {test_failed} failed")
+
+        # Clean up matcher to free GPU memory
+        del matcher
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # Final summary
-    total_train = len(train_rough_dict)
-    total_test = len(test_rough_dict)
-    total_all = len(image_types)
-
     print("\n" + "="*80)
     print("BATCH COLLECTION COMPLETE")
     print("="*80)
-    print(f"\nTrain Images:")
-    print(f"  Successful: {train_successful}/{total_train}")
-    print(f"  Failed:     {train_failed}")
-    print(f"\nTest Images:")
-    print(f"  Successful: {test_successful}/{total_test}")
-    print(f"  Failed:     {test_failed}")
-    print(f"\nTotal:")
-    print(f"  Successful: {train_successful + test_successful}/{total_all}")
-    print(f"  Failed:     {train_failed + test_failed}")
     print("\nNext steps:")
     print("  1. Review visualizations in match_visualizations/img_XXXX/")
     print("  2. Run analyze_matches.py on each image to tune position calculation")

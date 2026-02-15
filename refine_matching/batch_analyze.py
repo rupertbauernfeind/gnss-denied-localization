@@ -106,11 +106,17 @@ def main():
     root_dir = Path(__file__).parent
     match_dir_root = root_dir / "match_visualizations"
 
+    # Get matcher from command line or default to master
+    import sys
+    matcher = 'master'  # Default
+    if len(sys.argv) > 1 and sys.argv[1].startswith('--matcher='):
+        matcher = sys.argv[1].split('=')[1]
+
     # Find all image IDs that have match data with ground truth
     all_train_ids = []
     for img_dir in sorted(match_dir_root.glob("img_*")):
         img_id = int(img_dir.name.split("_")[1])
-        match_file = img_dir / "master_matches.npz"
+        match_file = img_dir / f"{matcher}_matches.npz"
         if match_file.exists():
             # Check if it has ground truth (train image)
             data = np.load(match_file)
@@ -126,79 +132,31 @@ def main():
     image_ids = sorted(random.sample(all_train_ids, sample_size))
 
     print(f"Using random sample of {sample_size} images for analysis")
-
-    # Get matcher from command line or default to master
-    import sys
-    matcher = 'master'  # Default
-    if len(sys.argv) > 1 and sys.argv[1].startswith('--matcher='):
-        matcher = sys.argv[1].split('=')[1]
-
     print(f"Matcher: {matcher}")
 
-    # Define methods to test (using lambdas for parameterized methods)
+    # Define methods to test (FAST methods only - streamlined for quick testing)
     methods_to_test = [
+        # Current best and variations
+        ("Similarity thresh=1.0", lambda *args: method_similarity_ransac_thresh(*args, threshold=1.0)),  # Current default
+        ("Similarity thresh=0.5", lambda *args: method_similarity_ransac_thresh(*args, threshold=0.5)),
+        ("Similarity thresh=1.5", lambda *args: method_similarity_ransac_thresh(*args, threshold=1.5)),
+        ("Similarity thresh=2.0", lambda *args: method_similarity_ransac_thresh(*args, threshold=2.0)),
+        ("Similarity thresh=3.0", lambda *args: method_similarity_ransac_thresh(*args, threshold=3.0)),
+
+        # Top performers from previous testing
         ("Top Median (Sim+Hom+Aff)", method_top_median),
         ("Weighted by inliers", method_weighted_by_inliers),
         ("Best by inliers", method_best_by_inliers),
-        ("Homography center", method_homography_center),
-        ("Median transform", method_median_transform),
-        ("Mean transform", method_mean_transform),
-        ("Weighted by distance", method_weighted_by_distance),
-        ("Homography corners", method_homography_corners),
-        ("Direct correspondence", method_direct_correspondence),
-        ("Top-3 nearest avg", lambda *args: method_top_k_nearest(*args, k=3)),
-        ("Top-5 nearest avg", lambda *args: method_top_k_nearest(*args, k=5)),
-        ("Top-10 nearest avg", lambda *args: method_top_k_nearest(*args, k=10)),
-        ("Median top-5", lambda *args: method_median_k_nearest(*args, k=5)),
-        ("Median top-10", lambda *args: method_median_k_nearest(*args, k=10)),
-        ("Median top-20", lambda *args: method_median_k_nearest(*args, k=20)),
-        ("Quadratic weighted", method_quadratic_weighted),
-        ("Exponential weighted", method_exponential_weighted),
-        ("Radius filter r=50", lambda *args: method_radius_filter(*args, radius=50)),
-        ("Radius filter r=100", lambda *args: method_radius_filter(*args, radius=100)),
-        ("Radius filter r=150", lambda *args: method_radius_filter(*args, radius=150)),
-        ("Median displacement", method_median_displacement),
-        ("Mean displacement", method_mean_displacement),
-        ("Weighted displacement", method_weighted_displacement),
-        ("Affine RANSAC", method_affine_ransac),
+
+        # Simple RANSAC methods
         ("Similarity RANSAC", method_similarity_ransac),
+        ("Affine RANSAC", method_affine_ransac),
+        ("Homography center", method_homography_center),
+
+        # Simple statistical methods
+        ("Median transform", method_median_transform),
+        ("Median displacement", method_median_displacement),
         ("Affine median", method_affine_median),
-        # Similarity variations (based on best performer)
-        ("Similarity thresh=1.0", lambda *args: method_similarity_ransac_thresh(*args, threshold=1.0)),
-        ("Similarity thresh=1.5", lambda *args: method_similarity_ransac_thresh(*args, threshold=1.5)),
-        ("Similarity thresh=3.0", lambda *args: method_similarity_ransac_thresh(*args, threshold=3.0)),
-        ("Reproj Sim thresh=1.0", lambda *args: method_reproj_filtered_similarity(*args, threshold=1.0)),
-        ("Reproj Sim thresh=1.5", lambda *args: method_reproj_filtered_similarity(*args, threshold=1.5)),
-        ("Reproj Sim thresh=2.0", lambda *args: method_reproj_filtered_similarity(*args, threshold=2.0)),
-        ("Iterative Sim n=2", lambda *args: method_iterative_similarity(*args, n_iterations=2)),
-        ("Iterative Sim n=3", lambda *args: method_iterative_similarity(*args, n_iterations=3)),
-        ("Weighted Sim σ=75", lambda *args: method_weighted_similarity(*args, sigma=75)),
-        ("Weighted Sim σ=100", lambda *args: method_weighted_similarity(*args, sigma=100)),
-        ("Local Sim r=75", lambda *args: method_local_similarity(*args, radius=75)),
-        ("Local Sim r=100", lambda *args: method_local_similarity(*args, radius=100)),
-        ("Local Sim r=125", lambda *args: method_local_similarity(*args, radius=125)),
-        ("Homography strict RANSAC", method_homography_strict_ransac),
-        ("Local H r=75", lambda *args: method_local_homography(*args, radius=75)),
-        ("Local H r=100", lambda *args: method_local_homography(*args, radius=100)),
-        ("Local H r=125", lambda *args: method_local_homography(*args, radius=125)),
-        ("Weighted H σ=75", lambda *args: method_weighted_homography(*args, sigma=75)),
-        ("Weighted H σ=100", lambda *args: method_weighted_homography(*args, sigma=100)),
-        ("Weighted H σ=125", lambda *args: method_weighted_homography(*args, sigma=125)),
-        ("PnP RANSAC", lambda *args: method_pnp_solver(*args, method_name="RANSAC")),
-        ("PnP ITERATIVE", lambda *args: method_pnp_solver(*args, method_name="ITERATIVE")),
-        ("PnP DLS", lambda *args: method_pnp_solver(*args, method_name="DLS")),
-        ("PnP hybrid", method_pnp_hybrid),
-        ("PyCOLMAP BA", method_pycolmap_ba),
-        # New robust variations (filtering & relaxed assumptions)
-        ("Reproj filter thresh=1.0", lambda *args: method_reproj_filtered_homography(*args, threshold=1.0)),
-        ("Reproj filter thresh=2.0", lambda *args: method_reproj_filtered_homography(*args, threshold=2.0)),
-        ("Reproj filter thresh=3.0", lambda *args: method_reproj_filtered_homography(*args, threshold=3.0)),
-        ("Normalized H", method_normalized_homography),
-        ("IRLS H (3 iter)", lambda *args: method_irls_homography(*args, n_iterations=3)),
-        ("IRLS H (5 iter)", lambda *args: method_irls_homography(*args, n_iterations=5)),
-        ("Local+Weighted r=100,σ=50", lambda *args: method_local_weighted_homography(*args, radius=100, sigma=50)),
-        ("Local+Weighted r=100,σ=75", lambda *args: method_local_weighted_homography(*args, radius=100, sigma=75)),
-        ("Symmetric H", method_symmetric_transfer_homography),
     ]
 
     # Collect all results: method_name -> [errors]
@@ -367,10 +325,16 @@ def generate_refined_predictions(matcher='master'):
     """
     import csv
 
+    # Determine best method for this matcher
+    if matcher == 'minima-roma':
+        method_name = "Affine RANSAC"
+    else:
+        method_name = "Similarity thresh=1.0"
+
     print("="*100)
     print("GENERATING REFINED PREDICTIONS")
     print(f"Matcher: {matcher}")
-    print("Method: Similarity thresh=1.0")
+    print(f"Method: {method_name}")
     print("="*100)
 
     root_dir = Path(__file__).parent.parent
@@ -420,7 +384,7 @@ def generate_refined_predictions(matcher='master'):
         drone_shape = tuple(data['drone_shape'])
         rough_x, rough_y = data['rough_position']
 
-        # Apply similarity thresh=1.0 method
+        # Apply Similarity thresh=1.0 method (best across full dataset)
         x_refined, y_refined, description = method_similarity_ransac_thresh(
             kp_drone, kp_crop, H, mask, crop_offset, drone_shape, threshold=1.0
         )
@@ -481,7 +445,7 @@ def generate_refined_predictions(matcher='master'):
         drone_shape = tuple(data['drone_shape'])
         rough_x, rough_y = data['rough_position']
 
-        # Apply similarity thresh=1.0 method
+        # Apply Similarity thresh=1.0 method (best across full dataset)
         x_refined, y_refined, description = method_similarity_ransac_thresh(
             kp_drone, kp_crop, H, mask, crop_offset, drone_shape, threshold=1.0
         )

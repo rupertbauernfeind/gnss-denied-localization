@@ -30,7 +30,7 @@ def main():
     # Load data
     print("Loading data...")
     gt_dict = load_csv(root / "data" / "train_data" / "train_pos.csv")
-    pred_dict = load_csv(Path(__file__).parent / "train_predictions.csv")
+    pred_dict = load_csv(Path(__file__).parent / "train_predictions_ensemble_rough_se2_roma.csv")
 
     print(f"Ground truth: {len(gt_dict)} images")
     print(f"Predictions:  {len(pred_dict)} images")
