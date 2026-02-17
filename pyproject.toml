@@ -7,9 +7,9 @@ package-dir = { "" = "src" }
 packages = { find = { where = ["src"] } }
 
 [project]
-name = "gdloc"
+name = "se3"
 version = "0.1.0"
-description = "gdloc"
+description = "se3"
 authors = [
     { name = "Rupert Bauernfeind", email = "rupertbauernfeind@example.com" },
 ]
